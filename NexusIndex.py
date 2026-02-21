@@ -193,6 +193,28 @@ class DynamicNexusIndex:
                 return {"offset": offset, "length": length, "timestamp": ts, "shard_id": shard_id}
         return None
 
+    def remove(self, url):
+        url_hash = hashlib.sha256(url.encode()).digest()[:16]
+        val_for_hash = struct.unpack("<Q", url_hash[:8])[0]
+        start_idx = val_for_hash % self.bucket_count
+        
+        for i in range(self.bucket_count):
+            idx = (start_idx + i) % self.bucket_count
+            pos = HEADER_SIZE + (idx * IDX_ENTRY_SIZE)
+            
+            existing_hash = self.mm[pos : pos + 16]
+            if existing_hash == b"\0" * 16: 
+                return False # 애초에 없음
+                
+            if existing_hash == url_hash:
+                # 삭제 표시: 해시를 비우고 내용을 초기화
+                self.mm[pos : pos + IDX_ENTRY_SIZE] = b"\0" * IDX_ENTRY_SIZE
+                self.used_count -= 1
+                # 헤더의 UsedCount 갱신
+                self.mm[10:14] = struct.pack("<I", self.used_count)
+                return True
+        return False
+
     # NexusIndex.py 내부 수정 권고
     def get_all_entries(self):
         entries = []

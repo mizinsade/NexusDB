@@ -8,7 +8,7 @@ from NexusLogEngine import ShardedNexusLogEngine
 from NexusIndex import DynamicNexusIndex
 from NexusWAL import NexusWAL, WAL_STATE
 from NexusLock import NexusLock
-from LSM import LSMInvertedIndex, NexusSSTable
+from LSM import LSMInvertedIndex
 
 
 
@@ -229,7 +229,7 @@ class NexusCore:
     def search(self, keyword):
         """키워드 기반 통합 검색"""
         # 1. LSM에서 URL 해시들 확보
-        url_hashes = self.lsm_index.search(keyword.lower())
+        url_hashes = self.lsm_index.search(keyword)
         
         results = []
         for u_hash in url_hashes:
@@ -243,56 +243,83 @@ class NexusCore:
                     results.append(data)
         return results
 
+    def ranking_search(self, keyword):
+        """키워드 기반 통합 검색"""
+        # 1. LSM에서 URL 해시들 확보
+        url_hashes = self.lsm_index.ranking_search(keyword)
+        
+        results = []
+        for u_hash in url_hashes:
+            # 2. KV 인덱스에서 위치 조회
+            idx_entry = self.index.lookup_by_hash(u_hash)
+            if idx_entry:
+                # 3. 실제 데이터 로드
+                shard_id_str = f"{idx_entry['shard_id']:02x}"
+                data = self.storage.read_record(shard_id_str, idx_entry['offset'])
+                if data:
+                    results.append(data)
+        return results
+
+    def delete(self, url):
+        u_hash = hashlib.sha256(url.encode()).digest()[:16]
+        self.last_lsn += 1
+        cur_lsn = self.last_lsn
+
+        try:
+            # 1. WAL에 삭제 의도 기록 (상태값은 별도의 DELETE 상수가 있다면 사용)
+            # 여기서는 편의상 PREPARE 단계에서 length를 0이나 특정 마커로 기록
+            self.wal.append(WAL_STATE.PREPARE, u_hash, 0, 0, int(time.time()), 0, cur_lsn)
+
+            # 2. KV 인덱스에서 제거
+            success = self.index.remove(url)
+            
+            # 3. LSM 역색인에서 제거 (Tombstone 처리)
+            # 역색인에서 해당 URL 해시를 가진 모든 키워드 연결을 끊어야 함
+            # 보통 LSM에서는 "content" 자리에 None이나 특정 삭제 마커를 넣음
+            self.lsm_index.add_document(u_hash, "") # 빈 문자열로 덮어씌워 검색 결과에서 제외
+
+            # 4. WAL COMMIT 및 헤더 갱신
+            self.wal.append(WAL_STATE.COMMIT, u_hash, 0, 0, 0, 0, cur_lsn)
+            self.index.update_header(lsn=cur_lsn)
+            self.index.flush_to_disk()
+
+            return success
+        except Exception as e:
+            print(f"[-] Delete failed: {e}")
+            return False
+
     def close(self):
         # 종료 전 메모리에 남은 LSM 인덱스를 파일로 저장
         if hasattr(self, 'lsm_index'):
             print("[*] Closing: Flushing LSM Memtable to disk...")
             self.lsm_index.flush() 
 
-        if self.lsm_index.should_compact : self.lsm_index.compact()
+        if self.lsm_index.should_compact : self.run_compact()
         
         self.index.close()
         print("[*] System closed safely.")
 
+    def run_compact(self):
+        # 현재 인덱스에 있는 모든 유효한 해시를 가져오는 함수를 전달
+        valid_hashes_getter = lambda: {e['u_hash'] for e in self.index.get_all_entries()}
+        self.lsm_index.compact(active_hashes_provider=valid_hashes_getter)
+
 if __name__ == "__main__":
     db_path = "my_local_search_db"
-    core = NexusCore(base_dir=db_path)
+    core = NexusCore(base_dir="multi_lang_db")
 
-    # 1. 테스트 데이터 정의
-    test_data = [
-        ("https://ollama.com/", "Ollama allows you to run open-source large language models locally."),
-        ("https://github.com/", "GitHub is where over 100 million developers shape the future of software, together."),
-        ("https://python.org/", "Python is a programming language that lets you work quickly and integrate systems more effectively.")
-    ]
+    # 다국어 데이터 입력
+    # core.put("https://ko.test", "파이썬 검색 엔진을 만들고 있습니다.")
+    # core.put("https://jp.test", "Pythonの検索エンジンを作っています。")
+    # core.put("https://en.test", "I am building a search engine with Python.")
 
-    print("--- [Step 1: Data Insertion] ---")
-    for url, content in test_data:
-        print(f"[*] Saving: {url}")
-        h = core.put(url, content, metadata={"source": "test_script"})
-        if h:
-            print(f"[+] Success! Hash: {h.hex()}")
-
-    print("\n--- [Step 2: Direct URL Lookup] ---")
-    search_url = "https://ollama.com/"
-    retrieved = core.get(search_url)
-    if retrieved:
-        print(f"[+] Found: {retrieved['content'][:60]}...")
-    else:
-        print(f"[-] Data not found for: {search_url}")
-
-    print("\n--- [Step 3: Keyword Search (LSM Index)] ---")
-    keyword = "language"
-    print(f"[*] Searching for keyword: '{keyword}'")
-    search_results = core.search(keyword)
+    # 1. 한국어 검색
+    print(core.search("파이썬 엔진")) 
     
-    if search_results:
-        print(f"[+] Found {len(search_results)} results:")
-        for res in search_results:
-            print(f" - {res['metadata']['u']} (Length: {len(res['content'])})")
-            # print(res)
-    else:
-        print("[-] No results found for keyword.")
+    # 2. 일본어 검색
+    print(core.search("検索エンジン"))
+    
+    # 3. 영어 검색
+    print(core.search("Search Engine"))
 
-    # 4. 종료 후 복구 테스트 준비
-    core.close()
-    print("\n[!] Database closed. Try running again to check Recovery logic.")
+    # core.close()

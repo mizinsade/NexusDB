@@ -175,32 +175,84 @@ class LSMInvertedIndex:
         if len(self.memtable) >= self.memtable_limit:
             self.flush()
 
-    def _tokenize(self, text):
-        # 1. 소문자화 및 특수문자 제거
-        # 언더바(_)를 포함한 특수문자를 공백으로 바꿈으로써 nexus_search_key 분리
-        text = re.sub(r'[^a-z0-9\s]', ' ', text.lower())
+    # def _tokenize(self, text):
+    #     # 1. 소문자화 및 특수문자 제거
+    #     # 언더바(_)를 포함한 특수문자를 공백으로 바꿈으로써 nexus_search_key 분리
+    #     text = re.sub(r'[^a-z0-9\s]', ' ', text.lower())
         
-        # 2. 불용어 및 길이 체크 (숫자는 무조건 통과)
-        stop_words = {'a', 'an', 'the', 'is', 'are'} # 불용어 최소화
+    #     # 2. 불용어 및 길이 체크 (숫자는 무조건 통과)
+    #     stop_words = {'a', 'an', 'the', 'is', 'are'} # 불용어 최소화
         
-        result = set()
-        for w in text.split():
-            if w in stop_words:
-                continue
-            # 숫자인 경우: 무조건 포함
-            # 문자인 경우: 2글자 이상만 (너무 짧은 관사 등 방어)
-            if w.isdigit() or len(w) > 1:
-                result.add(w)
+    #     result = set()
+    #     for w in text.split():
+    #         if w in stop_words:
+    #             continue
+    #         # 숫자인 경우: 무조건 포함
+    #         # 문자인 경우: 2글자 이상만 (너무 짧은 관사 등 방어)
+    #         if w.isdigit() or len(w) > 1:
+    #             result.add(w)
                 
-        return result
+    #     return result
 
-    def compact(self):
-        """기존 compact를 대체하는 Streaming Merge"""
+    def _tokenize(self, text):
+        """다국어 대응 N-Gram 토크나이저 (Bi-gram)"""
+        if not text: return set()
+        
+        # 1. 소문자화 및 특수문자 제거 (한/영/일/숫자 유지)
+        text = text.lower()
+        # 가-힣(한글), ぁ-ん(히라가나), ァ-ヶ(가타카나), 亜-熙(한자), a-z, 0-9 제외 제거
+        text = re.sub(r'[^a-z0-9가-힣ぁ-んァ-ヶ亜-熙\s]', ' ', text)
+        
+        words = text.split()
+        tokens = set()
+        
+        for word in words:
+            # 숫자는 통째로 인덱싱
+            if word.isdigit():
+                tokens.add(word)
+                continue
+            
+            # 2글자 미만은 그냥 추가
+            if len(word) < 2:
+                tokens.add(word)
+                continue
+            
+            # Bi-gram: 2글자씩 쪼개기 (한국어/일본어 조사 무력화 및 부분 검색 지원)
+            for i in range(len(word) - 1):
+                tokens.add(word[i:i+2])
+            
+            # 영어 단어나 긴 명사를 위해 원본도 보존
+            if len(word) > 2:
+                tokens.add(word)
+        
+        return tokens
+    
+    def remove_document_from_memtable(self, url_hash):
+        """
+        메모리에 있는 특정 문서의 흔적을 지움. 
+        실제 완전한 삭제는 Compaction 단계에서 index와 대조하여 수행됨.
+        """
+        for word in list(self.memtable.keys()):
+            if url_hash in self.memtable[word]:
+                self.memtable[word].remove(url_hash)
+                if not self.memtable[word]:
+                    del self.memtable[word]
+
+    def compact(self, active_hashes_provider=None):
+        """
+        active_hashes_provider: 현재 유효한(삭제되지 않은) 해시 집합을 주는 함수
+        이 함수를 통해 삭제된 데이터를 물리적으로 제거함
+        """
         if len(self.tables) < 2: return
+        
+        # 유효한 해시 셋 가져오기 (NexusCore.index에서 관리하는 해시들)
+        valid_hashes = None
+        if active_hashes_provider:
+            valid_hashes = active_hashes_provider()
+
         output_name = f"compact_{int(time.time())}.sst"
         output_path = os.path.join(self.index_dir, output_name)
         
-        # Streaming Merge 실행
         paths = [t.path for t in self.tables]
         iters = [SSTableIterator(p) for p in paths]
         heap = []
@@ -210,21 +262,43 @@ class LSMInvertedIndex:
         with open(output_path, "wb") as f:
             f.write(struct.pack(HEADER_FMT, MAGIC, 0))
             count, last_term, current_hashes = 0, None, set()
+            
             while heap:
                 term, i = heapq.heappop(heap)
                 entry = iters[i].pop()
-                if term == last_term: current_hashes.update(entry[1])
+                
+                if term == last_term:
+                    current_hashes.update(entry[1])
                 else:
                     if last_term:
-                        self._write_entry(f, last_term, current_hashes); count += 1
+                        # 유효한 해시만 필터링 (삭제된 문서 제거)
+                        if valid_hashes is not None:
+                            current_hashes &= valid_hashes
+                        
+                        if current_hashes: # 필터링 후에도 해시가 남은 경우만 씀
+                            self._write_entry(f, last_term, current_hashes)
+                            count += 1
+                    
                     last_term, current_hashes = term, set(entry[1])
-                if iters[i].current_entry: heapq.heappush(heap, (iters[i].current_entry[0], i))
+                
+                if iters[i].current_entry: 
+                    heapq.heappush(heap, (iters[i].current_entry[0], i))
+
+            # 마지막 남은 엔트리 처리
             if last_term:
-                self._write_entry(f, last_term, current_hashes); count += 1
+                if valid_hashes is not None:
+                    current_hashes &= valid_hashes
+                if current_hashes:
+                    self._write_entry(f, last_term, current_hashes)
+                    count += 1
+                    
             f.seek(4); f.write(struct.pack("<I", count))
 
+        # 정리
         for it in iters: it.close()
-        for p in paths: os.remove(p)
+        for p in paths: 
+            try: os.remove(p)
+            except: pass
         self.tables = [NexusSSTable(output_path)]
         print(f"[*] Compaction finished: {output_name}")
     
@@ -264,36 +338,6 @@ class LSMInvertedIndex:
         
         for it in iters: it.close()
 
-    # def compact_atomic(self):
-    #     """Atomic Rename 기반의 Crash-safe Compaction"""
-    #     if len(self.sstable_files) < 2: return
-        
-    #     # 1. 대상 선정 및 임시 파일명 정의
-    #     targets = self.sstable_files[:]
-    #     tmp_filename = f"compact_{int(time.time())}.sst.tmp"
-    #     tmp_path = os.path.join(self.index_dir, tmp_filename)
-    #     final_filename = tmp_filename.replace(".tmp", "")
-    #     final_path = os.path.join(self.index_dir, final_filename)
-
-    #     # 2. Streaming Merge를 임시 파일에 기록
-    #     self._streaming_merge_to_file(targets, tmp_path)
-
-    #     # 3. fsync: 임시 파일이 디스크에 완전히 기록됨을 보장
-    #     with open(tmp_path, "ab") as f:
-    #         os.fsync(f.fileno())
-
-    #     # 4. Atomic Rename: 기존 파일을 새 파일로 원자적 교체
-    #     # (POSIX 계열에서 rename은 원자적임)
-    #     os.rename(tmp_path, final_path)
-
-    #     # 5. Cleanup: 이전 SSTable 삭제
-    #     for f in targets:
-    #         try: os.remove(os.path.join(self.index_dir, f))
-    #         except: pass
-        
-    #     self.sstable_files = [final_filename]
-    #     self._rebuild_sparse_indexes()
-
     def _write_entry(self, f, term, hashes):
         tb = term.encode('utf-8')
         f.write(struct.pack(f"<H{len(tb)}sI", len(tb), tb, len(hashes)))
@@ -317,6 +361,31 @@ class LSMInvertedIndex:
                     # pass
         
         return list(results)
+
+    def ranking_search(self, keyword):
+        """랭킹(Scoring)이 포함된 검색"""
+        query_tokens = self._tokenize(keyword)
+        if not query_tokens: return []
+
+        # hash -> score 매핑 (많이 매칭될수록 높은 점수)
+        score_map = collections.Counter()
+        
+        for token in query_tokens:
+            # 1. 메모리 검색
+            if token in self.memtable:
+                for h in self.memtable[token]:
+                    score_map[h] += 1
+            
+            # 2. SSTables 검색
+            for sst in self.tables:
+                found_hashes = sst.search(token)
+                for h in found_hashes:
+                    score_map[h] += 1
+        
+        # 점수가 높은 순으로 정렬하여 리턴 (구글의 가장 기초적인 원리)
+        # [(hash, score), ...] -> [hash, ...]
+        sorted_results = [item[0] for item in score_map.most_common()]
+        return sorted_results
 
 import math
 import array
