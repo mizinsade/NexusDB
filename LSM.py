@@ -135,18 +135,6 @@ class LSMInvertedIndex:
         if self.tables:
             print(f"[*] LSM Loaded {len(self.tables)} SSTables.")
 
-    # def search(self, keyword):
-    #     # 1. 메모리 검색
-    #     results = set(self.memtable.get(keyword, []))
-        
-    #     # 2. 디스크 검색 (lookup -> search 오타 수정 반영)
-    #     for sst in self.tables:
-    #         disk_results = sst.search(keyword) # 이전에 찾은 오타 수정
-    #         if disk_results:
-    #             results.update(disk_results)
-        
-    #     return list(results)
-
     def flush(self):
         if not self.memtable: return
         # 파일 중복 방지를 위해 더 정밀한 타임스탬프 사용
@@ -187,16 +175,6 @@ class LSMInvertedIndex:
         if len(self.memtable) >= self.memtable_limit:
             self.flush()
 
-    # def _tokenize(self, text):
-    #     stop_words = {'a', 'an', 'the', 'is', 'are', 'and', 'or'}
-        
-    #     # 수정 포인트: 알파벳과 숫자만 남기고 '_'를 포함한 모든 특수문자를 공백으로 바꿉니다.
-    #     # 이렇게 하면 'nexus_search_key'는 'nexus search key'가 되어 3개의 단어로 인덱싱됩니다.
-    #     clean_text = re.sub(r'[^a-z0-9]', ' ', text.lower())
-        
-    #     words = clean_text.split()
-    #     return {w for w in words if len(w) > 1 and w not in stop_words}
-
     def _tokenize(self, text):
         # 1. 소문자화 및 특수문자 제거
         # 언더바(_)를 포함한 특수문자를 공백으로 바꿈으로써 nexus_search_key 분리
@@ -215,20 +193,6 @@ class LSMInvertedIndex:
                 result.add(w)
                 
         return result
-
-    # def flush(self):
-    #     if not self.memtable: return
-    #     filename = f"sst_{int(time.time() * 1000)}.sst"
-    #     path = os.path.join(self.index_dir, filename)
-    #     NexusSSTable.write_from_memtable(self.memtable, path)
-        
-    #     # [Durability] 물리 디스크 기록 보장
-    #     with open(path, "ab") as f:
-    #         os.fsync(f.fileno())
-            
-    #     self.memtable.clear()
-    #     self.tables.append(NexusSSTable(path))
-    #     print(f"[*] LSM Flush: {filename} created and synced.")
 
     def compact(self):
         """기존 compact를 대체하는 Streaming Merge"""
@@ -341,7 +305,7 @@ class LSMInvertedIndex:
         results = set()
         for token in query_tokens:
             # 1. 메모리(Memtable) 검색
-            results = set(self.memtable.get(token, []))
+            results.update(self.memtable.get(token, []))
             # results = set()
             
             # 2. 디스크(SSTables) 검색

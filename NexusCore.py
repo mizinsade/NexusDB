@@ -248,6 +248,8 @@ class NexusCore:
         if hasattr(self, 'lsm_index'):
             print("[*] Closing: Flushing LSM Memtable to disk...")
             self.lsm_index.flush() 
+
+        if self.lsm_index.should_compact : self.lsm_index.compact()
         
         self.index.close()
         print("[*] System closed safely.")
