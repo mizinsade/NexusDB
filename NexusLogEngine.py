@@ -1,3 +1,4 @@
+#NexusLogEngine.py
 import os
 import struct
 import hashlib

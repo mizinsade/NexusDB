@@ -1,7 +1,9 @@
+#NexusWAL.py
 import struct
 import os
 import zlib
 import fcntl
+
 
 # LSN(Q), State(B), Hash(16s), Offset(Q), Len(I), TS(I), Shard(H), CRC(I) = 44 Bytes
 WAL_ENTRY_FMT = "<Q B 16s Q I I H I"
@@ -12,6 +14,8 @@ class WAL_STATE:
     COMMIT = 2
     RESIZE_START = 3
     RESIZE_END = 4
+    COMPACT_START = 5
+    COMPACT_END = 6
 
 class NexusWAL:
     def __init__(self, wal_path):

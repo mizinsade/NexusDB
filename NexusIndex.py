@@ -1,3 +1,5 @@
+#NexusIndex.py
+
 import mmap
 import os
 import struct
@@ -173,6 +175,42 @@ class DynamicNexusIndex:
                 _, offset, length, ts, shard_id = struct.unpack(IDX_ENTRY_STRUCT, self.mm[pos:pos+IDX_ENTRY_SIZE])
                 return {"offset": offset, "length": length, "timestamp": ts, "shard_id": shard_id}
         return None
+
+    def lookup_by_hash(self, url_hash):
+        """URL 문자열이 아닌 16바이트 해시값으로 직접 위치 조회"""
+        val_for_hash = struct.unpack("<Q", url_hash[:8])[0]
+        start_idx = val_for_hash % self.bucket_count
+        
+        for i in range(self.bucket_count):
+            idx = (start_idx + i) % self.bucket_count
+            pos = HEADER_SIZE + (idx * IDX_ENTRY_SIZE)
+            
+            existing_hash = self.mm[pos : pos + 16]
+            if existing_hash == b"\0" * 16: 
+                return None
+            if existing_hash == url_hash:
+                _, offset, length, ts, shard_id = struct.unpack(IDX_ENTRY_STRUCT, self.mm[pos:pos+IDX_ENTRY_SIZE])
+                return {"offset": offset, "length": length, "timestamp": ts, "shard_id": shard_id}
+        return None
+
+    # NexusIndex.py 내부 수정 권고
+    def get_all_entries(self):
+        entries = []
+        # HEADER_SIZE (22)를 사용해야 함
+        self.mm.seek(HEADER_SIZE) 
+        for i in range(self.bucket_count):
+            data = self.mm.read(IDX_ENTRY_SIZE)
+            if not data: break
+            
+            u_hash = data[:16]
+            if any(u_hash):
+                # 패딩(2x)을 포함한 언패킹
+                res = struct.unpack(IDX_ENTRY_STRUCT, data)
+                entries.append({
+                    'u_hash': res[0], 'offset': res[1], 
+                    'length': res[2], 'ts': res[3], 'shard_id': res[4]
+                })
+        return entries
 
     def close(self):
         if hasattr(self, 'mm'): self.mm.close()
