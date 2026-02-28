@@ -6,10 +6,12 @@ import struct
 import hashlib
 import shutil
 
-# [Header] Magic(4), Version(2), BucketCount(I), UsedCount(I), LastLSN(Q) = 22 Bytes
-IDX_HEADER_FORMAT = "<4sHIIQ"
+# [Header] Magic(4), Ver(2), Buckets(I), Used(I), LSN(Q), IsClean(B) = 23 Bytes
+# 정렬(Alignment)을 위해 24바이트로 맞추는 것이 좋습니다.
+IDX_HEADER_FORMAT = "<4sHIIQ B 1x"
 IDX_MAGIC = b"NIDX"
 HEADER_SIZE = struct.calcsize(IDX_HEADER_FORMAT)
+
 
 # [Entry] 16s(Hash), Q(Offset), I(Length), I(TS), H(ShardID), 2x(Padding) = 36 Bytes
 IDX_ENTRY_STRUCT = "<16sQIIH2x"
@@ -21,67 +23,57 @@ class DynamicNexusIndex:
         self.last_lsn = 0
         self.bucket_count = 0
         self.used_count = 0
+        self.is_rebuild_required = False
         self._load_or_create(initial_buckets)
 
     def _load_or_create(self, bucket_count):
         exists = os.path.exists(self.index_path)
         
-        # 1. 일단 r+b로 시도, 없으면 wb+로 생성 (핸들 유지)
         if not exists:
             self.f = open(self.index_path, "wb+")
-            # 초기 헤더 작성
-            header = struct.pack(IDX_HEADER_FORMAT, IDX_MAGIC, 1, bucket_count, 0, 0)
+            # 초기 생성 시 IsClean = 1 (깨끗함)
+            header = struct.pack(IDX_HEADER_FORMAT, IDX_MAGIC, 1, bucket_count, 0, 0, 1)
             self.f.write(header)
-            
-            # 2. 물리적 크기 강제 할당 (이게 핵심입니다)
             total_size = HEADER_SIZE + (bucket_count * IDX_ENTRY_SIZE)
-            self.f.truncate(total_size) 
-            self.f.seek(0, os.SEEK_END)
-            
-            # 만약 truncate가 작동하지 않는 환경을 대비해 마지막 바이트에 직접 쓰기
-            if self.f.tell() < total_size:
-                self.f.seek(total_size - 1)
-                self.f.write(b'\0')
-                
+            self.f.truncate(total_size)
             self.f.flush()
             os.fsync(self.f.fileno())
         else:
             self.f = open(self.index_path, "r+b")
 
-        # 3. 파일 크기 재검증
-        actual_size = os.path.getsize(self.index_path)
-        if actual_size == 0:
-            # 이 시점에도 0이라면, OS의 권한 문제이거나 디스크 용량 부족일 가능성이 큽니다.
-            # 수동으로 강제 쓰기를 한 번 더 시도
-            self.f.write(struct.pack(IDX_HEADER_FORMAT, IDX_MAGIC, 1, bucket_count, 0, 0))
-            self.f.flush()
-            os.fsync(self.f.fileno())
-            actual_size = os.path.getsize(self.index_path)
-
-        # 4. mmap 매핑 (파일 크기를 명시적으로 전달)
-        # 헤더를 먼저 읽어 실제 버킷 수를 파악
+        # 헤더 정보 로드
         self.f.seek(0)
         header_data = self.f.read(HEADER_SIZE)
-        if len(header_data) != HEADER_SIZE:
-            raise ValueError("Corrupted index header")
-        _, _, self.bucket_count, self.used_count, self.last_lsn = struct.unpack(
+        magic, ver, self.bucket_count, self.used_count, self.last_lsn, is_clean = struct.unpack(
             IDX_HEADER_FORMAT, header_data
         )
-        
+
+        # 비정상 종료 감지: 파일이 존재하는데 is_clean이 0이면 리빌드 필요
+        if is_clean == 0 and self.last_lsn != 0:
+            self.is_rebuild_required = True
+
+        # mmap 매핑
         file_size = HEADER_SIZE + (self.bucket_count * IDX_ENTRY_SIZE)
         self.mm = mmap.mmap(self.f.fileno(), file_size)
 
+        # 열자마자 Dirty Flag를 0으로 설정 (작업 중임을 표시)
+        self._set_dirty_flag(0)
 
-    def update_header(self, lsn=None):
-        """메모리 맵 헤더 갱신"""
-        if lsn is not None: 
-            self.last_lsn = lsn
+    def _set_dirty_flag(self, value):
+        """IsClean 바이트(위치 22)를 직접 수정"""
+        # IDX_HEADER_FORMAT 상 IsClean은 4+2+4+4+8 = 22번째 바이트
+        self.mm[22:23] = struct.pack("B", value)
+
+    def update_header(self, lsn=None, is_clean=None):
+        if lsn is not None: self.last_lsn = lsn
+        # # is_clean이 인자로 오면 업데이트, 아니면 기존 dirty(0) 유지
+        # clean_val = is_clean if is_clean is not None else 0 
         header = struct.pack(IDX_HEADER_FORMAT, IDX_MAGIC, 1, 
-                             self.bucket_count, self.used_count, self.last_lsn)
+                            self.bucket_count, self.used_count, self.last_lsn, 0)
         self.mm[:HEADER_SIZE] = header
 
     def get_last_lsn(self):
-        _, _, _, _, lsn = struct.unpack(IDX_HEADER_FORMAT, self.mm[:HEADER_SIZE])
+        _, _, _, _, lsn, _ = struct.unpack(IDX_HEADER_FORMAT, self.mm[:HEADER_SIZE])
         return lsn
 
     def flush_to_disk(self):
@@ -234,6 +226,45 @@ class DynamicNexusIndex:
                 })
         return entries
 
+    def rebuild_from_storage(self, storage_manager):
+        """
+        storage_manager는 실제 데이터 파일(Shard)을 순회하며 
+        (hash, offset, length, ts, shard_id)를 yield하는 iterator를 가져야 합니다.
+        """
+        print("비정상 종료 감지: 인덱스 재구성을 시작합니다...")
+        
+        # 1. 기존 연결 정리
+        self.close()
+        
+        # 2. 새 인덱스 파일 초기화 (기존 크기 혹은 적절한 크기로)
+        recovery_path = self.index_path + ".recovery"
+        new_idx = DynamicNexusIndex(recovery_path, initial_buckets=self.bucket_count)
+        
+        # 3. 데이터 원본으로부터 모든 엔트리 다시 삽입
+        # storage_manager.get_all_records()는 실제 shard 파일을 바이트 단위로 읽어 정보를 추출하는 함수
+        for record in storage_manager.get_all_records():
+            new_idx._raw_insert(
+                record['hash'], record['offset'], 
+                record['length'], record['ts'], record['shard_id']
+            )
+        
+        # 4. 종료 및 교체
+        new_idx.update_header(lsn=storage_manager.get_current_lsn(), is_clean=1)
+        new_idx.flush_to_disk()
+        new_idx.close()
+        
+        os.replace(recovery_path, self.index_path)
+        
+        # 5. 다시 로드
+        self._load_or_create(self.bucket_count)
+        self.is_rebuild_required = False
+        print("인덱스 복구 완료.")
+
     def close(self):
-        if hasattr(self, 'mm'): self.mm.close()
-        if hasattr(self, 'f'): self.f.close()
+        if hasattr(self, 'mm'):
+            # 정상 종료 시 IsClean을 1로 설정
+            self._set_dirty_flag(1)
+            self.mm.flush()
+            self.mm.close()
+        if hasattr(self, 'f'):
+            self.f.close()

@@ -4,11 +4,11 @@ import os
 import struct
 import hashlib
 import shutil
-from NexusLogEngine import ShardedNexusLogEngine
-from NexusIndex import DynamicNexusIndex
-from NexusWAL import NexusWAL, WAL_STATE
-from NexusLock import NexusLock
-from LSM import LSMInvertedIndex
+from .NexusLogEngine import ShardedNexusLogEngine
+from .NexusIndex import DynamicNexusIndex
+from .NexusWAL import NexusWAL, WAL_STATE
+from .NexusLock import NexusLock
+from .LSM import LSMInvertedIndex
 
 
 
@@ -30,6 +30,12 @@ class NexusCore:
         return {w.lower().strip(".,! ") for w in text.split() if len(w) > 1}
 
     def _recover(self):
+        # 1. 인덱스 엔진이 리빌드를 요구하는지 확인
+        if self.index.is_rebuild_required:
+            self._full_rebuild()
+            return
+
+        # 2. 리빌드가 필요 없다면 기존의 WAL Redo 로직 수행
         """NexusWAL의 구조(lsn=0, state=1, hash=2, off=3, len=4, ts=5, shard=6)에 맞춤"""
         all_entries = self.wal.read_all()
         checkpoint_lsn = self.index.get_last_lsn()
@@ -87,91 +93,38 @@ class NexusCore:
         # 리사이즈 마커는 데이터가 없으므로 0/empty 값으로 기록
         self.wal.append(state, b"\0"*16, new_size, 0, 0, 0, self.last_lsn)
 
-    # def _put_kv_storage(self, url, content, metadata=None):
+    def _full_rebuild(self):
+        print("[*] Starting Full Index Rebuild from Shards...")
         
-    #     with self.index_lock.exclusive():
-    #         if (self.index.used_count / self.index.bucket_count) > 0.7:
-    #             self.index._resize(core_callback=self._resize_wal_callback)
-
-    #     with self.index_lock.exclusive():
-    #         self.last_lsn += 1
-    #         u_hash = hashlib.sha256(url.encode()).digest()[:16]
-            
-    #         try:
-    #             # 1. 스토리지 로그 기록 (데이터 본문)
-    #             log_info = self.storage.append_record(url, content, metadata=metadata)
-    #             s_id = int(log_info['shard_id'], 16)
-
-    #             # 2. WAL PREPARE (인덱스 쓰기 전 의도 기록)
-    #             self.wal.append(WAL_STATE.PREPARE, u_hash, log_info['offset'], 
-    #                             log_info['length'], log_info['timestamp'], s_id, self.last_lsn)
-
-    #             # 3. 인덱스 기록
-    #             self.index._raw_insert(u_hash, log_info['offset'], log_info['length'], 
-    #                                 log_info['timestamp'], s_id)
-
-    #             # 5. 주기적 또는 매번 Checkpoint LSN 업데이트
-    #             self.index.update_header(lsn=self.last_lsn)
-                
-    #             # 4. 인덱스 물리적 Flush (가장 중요)
-    #             self.index.flush_to_disk()
-
-
-    #             # 6. COMMIT 기록
-    #             self.wal.append(WAL_STATE.COMMIT, u_hash, 0, 0, 0, 0, self.last_lsn)
-                
-    #             return log_info['url_hash']
-    #         except Exception as e:
-    #             print(f"[-] Put failed: {e}")
-    #             return None
-
-    # def put(self, url, content, metadata=None):
-    #     # 1. KV 스토리지 저장 (기존 로직)
-    #     url_hash = self._put_kv_storage(url, content, metadata)
+        # 1. 기존 인덱스 파일 폐기 및 재생성
+        self.index.close()
+        if os.path.exists(self.index.index_path):
+            os.remove(self.index.index_path)
+        self.index = DynamicNexusIndex(self.index.index_path) # 새로 생성
         
-    #     if url_hash:
-    #         # 2. LSM 역색인에 키워드 추가
-    #         # 여기서 url_hash는 16바이트 binary
-    #         self.lsm_index.add_document(url_hash, content)
-
-    #         if len(self.lsm_index.sstable_files) >= 5:
-    #             self.lsm_index.compact()
+        # 2. 모든 샤드 데이터 스캔 및 삽입
+        count = 0
+        for record in self.storage.walk_all_records():
+            # KV 인덱스(nexus.idx) 복구
+            self.index._raw_insert(
+                record['u_hash'], 
+                record['offset'], 
+                record['length'], 
+                record['ts'], 
+                record['shard_id']
+            )
             
-    #     return url_hash
-
-    # def put(self, url, content, metadata=None):
-    #     u_hash = hashlib.sha256(url.encode()).digest()[:16]
-    #     self.last_lsn += 1
-    #     cur_lsn = self.last_lsn
-
-    #     try:
-    #         # [단계 1] Storage Append
-    #         log_info = self.storage.append_record(url, content, metadata=metadata)
-    #         shard_id_int = int(log_info['shard_id'], 16)
+            # LSM 역색인 복구
+            self.lsm_index.add_document(record['u_hash'], record['content'])
+            count += 1
             
-    #         # [단계 2] WAL PREPARE + fsync
-    #         self.wal.append(WAL_STATE.PREPARE, u_hash, log_info['offset'], 
-    #                         log_info['length'], log_info['timestamp'], shard_id_int, cur_lsn)
-            
-    #         # [단계 3] Index Data Write
-    #         self.index._raw_insert(u_hash, log_info['offset'], log_info['length'], 
-    #                                log_info['timestamp'], shard_id_int)
-            
-    #         # [단계 4] WAL COMMIT + fsync
-    #         self.wal.append(WAL_STATE.COMMIT, u_hash, 0, 0, 0, 0, cur_lsn)
-
-    #         # [단계 5] Index Header 업데이트 (Checkpoint) 및 물리적 저장
-    #         # DynamicNexusIndex에는 flush_to_disk가 헤더와 데이터를 모두 포함합니다.
-    #         self.index.update_header(lsn=cur_lsn)
-    #         self.index.flush_to_disk() 
-
-    #         # [LSM] 반영 (이제 에러 없이 여기까지 도달하여 검색이 가능해집니다)
-    #         self.lsm_index.add_document(u_hash, content)
-            
-    #         return u_hash
-    #     except Exception as e:
-    #         print(f"[-] Transaction failed at LSN {cur_lsn}: {e}")
-    #         return None
+        # 3. 헤더에 마지막 LSN 기록 및 Clean 설정
+        # WAL의 마지막 LSN을 가져와서 기록하면 이후 WAL 복구와도 연동됨
+        latest_lsn = self.wal.get_latest_lsn() 
+        self.index.update_header(lsn=latest_lsn)
+        self.index.flush_to_disk()
+        
+        print(f"[*] Rebuild complete. {count} records restored.")
 
     def put(self, url, content, metadata=None):
         u_hash = hashlib.sha256(url.encode()).digest()[:16]
@@ -202,6 +155,7 @@ class NexusCore:
             
             # (선택 사항) LSM이 너무 안 써진다면 강제 플러시 테스트
             # if cur_lsn % 100 == 0: self.lsm_index.flush()
+            if self.lsm_index.should_compact : self.run_compact()
             
             return u_hash
         except Exception as e:
@@ -309,9 +263,9 @@ if __name__ == "__main__":
     core = NexusCore(base_dir="multi_lang_db")
 
     # 다국어 데이터 입력
-    # core.put("https://ko.test", "파이썬 검색 엔진을 만들고 있습니다.")
-    # core.put("https://jp.test", "Pythonの検索エンジンを作っています。")
-    # core.put("https://en.test", "I am building a search engine with Python.")
+    core.put("https://ko.test", "파이썬 검색 엔진을 만들고 있습니다.")
+    core.put("https://jp.test", "Pythonの検索エンジンを作っています。")
+    core.put("https://en.test", "I am building a search engine with Python.")
 
     # 1. 한국어 검색
     print(core.search("파이썬 엔진")) 
@@ -322,4 +276,4 @@ if __name__ == "__main__":
     # 3. 영어 검색
     print(core.search("Search Engine"))
 
-    # core.close()
+    core.close()

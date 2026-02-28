@@ -27,6 +27,8 @@ class NexusWAL:
 
     def append(self, state, u_hash, offset, length, timestamp, shard_id, lsn):
         # CRC를 제외한 데이터 패킹
+        if isinstance(shard_id, str):
+            shard_id = int(shard_id, 16)
         core_data = struct.pack("<Q B 16s Q I I H", 
                                 lsn, state, u_hash, offset, length, timestamp, shard_id)
         crc = self._calc_crc(core_data)
@@ -38,6 +40,26 @@ class NexusWAL:
             f.flush()
             os.fsync(f.fileno()) # 물리적 기록 보장
             fcntl.flock(f, fcntl.LOCK_UN)
+
+    def get_latest_lsn(self):
+        """WAL 파일의 마지막 엔트리에서 LSN을 추출"""
+        if not os.path.exists(self.wal_path) or os.path.getsize(self.wal_path) < WAL_SIZE:
+            return 0
+        
+        with open(self.wal_path, "rb") as f:
+            try:
+                # 마지막 엔트리 위치로 이동
+                f.seek(-WAL_SIZE, os.SEEK_END)
+                buf = f.read(WAL_SIZE)
+                if len(buf) == WAL_SIZE:
+                    data_part = buf[:-4]
+                    stored_crc = struct.unpack("<I", buf[-4:])[0]
+                    if self._calc_crc(data_part) == stored_crc:
+                        # LSN은 첫 8바이트 (Q)
+                        return struct.unpack("<Q", buf[:8])[0]
+            except Exception:
+                pass
+        return 0
 
     def read_all(self):
         """복구를 위해 WAL 전체를 읽어 유효한 엔트리만 반환"""

@@ -95,3 +95,57 @@ class ShardedNexusLogEngine:
                 "metadata": json.loads(meta_bytes.decode()),
                 "content": content
             }
+
+    def walk_all_records(self):
+        """모든 샤드 파일을 순회하며 유효한 레코드를 yield (인덱스 복구용)"""
+        decompressor = zstd.ZstdDecompressor()
+        
+        # 1. 모든 .nxs 파일 목록 가져오기
+        shard_files = [f for f in os.listdir(self.root_dir) if f.endswith(".nxs")]
+        
+        for shard_file in shard_files:
+            shard_id = shard_file.replace(".nxs", "")
+            path = os.path.join(self.root_dir, shard_file)
+            
+            with open(path, "rb") as f:
+                while True:
+                    offset = f.tell()
+                    header_data = f.read(32) # HEADER_SIZE
+                    if not header_data or len(header_data) < 32:
+                        break # 파일 끝 도달
+                    
+                    try:
+                        magic, ver, r_type, m_len, b_len, csum = struct.unpack(HEADER_FORMAT, header_data)
+                        
+                        if magic != MAGIC:
+                            # 매직 넘버가 다르면 다음 1바이트씩 이동하며 찾거나 해당 파일 스킵
+                            # 여기서는 간단히 다음 파일로 넘어감
+                            break 
+                            
+                        meta_bytes = f.read(m_len)
+                        body_compressed = f.read(b_len)
+                        
+                        # 체크포인트: 데이터가 잘렸는지 확인
+                        if len(body_compressed) < b_len:
+                            break
+                            
+                        # 메타데이터에서 URL 추출 (해시 재계산용)
+                        meta = json.loads(meta_bytes.decode())
+                        url = meta.get('u', "")
+                        u_hash_bytes = hashlib.sha256(url.encode()).digest()[:16] # 16바이트 바이너리 해시
+                        
+                        # LSM 복구를 위해 본문 복원
+                        content = decompressor.decompress(body_compressed).decode()
+                        
+                        yield {
+                            "u_hash": u_hash_bytes,
+                            "offset": offset,
+                            "length": 32 + m_len + b_len,
+                            "ts": meta.get('t', 0),
+                            "shard_id": int(shard_id, 16), # 16진수 문자열을 숫자로
+                            "content": content
+                        }
+                        
+                    except Exception as e:
+                        print(f"[!] Error parsing record at {shard_file}:{offset} - {e}")
+                        break
