@@ -155,7 +155,7 @@ class NexusCore:
             
             # (선택 사항) LSM이 너무 안 써진다면 강제 플러시 테스트
             # if cur_lsn % 100 == 0: self.lsm_index.flush()
-            if self.lsm_index.should_compact : self.run_compact()
+            if self.lsm_index.should_compact() : self.run_compact()
             
             return u_hash
         except Exception as e:
@@ -248,7 +248,7 @@ class NexusCore:
             print("[*] Closing: Flushing LSM Memtable to disk...")
             self.lsm_index.flush() 
 
-        if self.lsm_index.should_compact : self.run_compact()
+        if self.lsm_index.should_compact() : self.run_compact()
         
         self.index.close()
         print("[*] System closed safely.")
