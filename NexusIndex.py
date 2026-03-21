@@ -18,12 +18,13 @@ IDX_ENTRY_STRUCT = "<16sQIIH2x"
 IDX_ENTRY_SIZE = struct.calcsize(IDX_ENTRY_STRUCT)
 
 class DynamicNexusIndex:
-    def __init__(self, index_path="nexus.idx", initial_buckets=1_000_000):
+    def __init__(self, index_path="nexus.idx", initial_buckets=1_000_000, read_only=0):
         self.index_path = index_path
         self.last_lsn = 0
         self.bucket_count = 0
         self.used_count = 0
         self.is_rebuild_required = False
+        self.read_only = read_only
         self._load_or_create(initial_buckets)
 
     def _load_or_create(self, bucket_count):
@@ -57,7 +58,8 @@ class DynamicNexusIndex:
         self.mm = mmap.mmap(self.f.fileno(), file_size)
 
         # 열자마자 Dirty Flag를 0으로 설정 (작업 중임을 표시)
-        self._set_dirty_flag(0)
+        if self.read_only != 1:
+            self._set_dirty_flag(0)
 
     def _set_dirty_flag(self, value):
         """IsClean 바이트(위치 22)를 직접 수정"""

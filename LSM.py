@@ -118,6 +118,10 @@ class SSTableIterator:
     def close(self): self.f.close()
 
 import re
+import json
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 class LSMInvertedIndex:
     def __init__(self, index_dir, memtable_limit=5000):
@@ -127,6 +131,24 @@ class LSMInvertedIndex:
         self.memtable_limit = memtable_limit
         # 파일명을 정렬하여 최신 데이터 순서(또는 생성 순서)로 로드
         self.tables = []
+
+        # # 1. 벡터 데이터를 저장할 경로 및 변수 초기화
+        # self.vector_store = {}
+        # self.vector_file = os.path.join(self.index_dir, "nexus_vectors.pkl")
+        # self.status_file = os.path.join(self.index_dir, "vector_status.json")
+        # self.vector_store = self._load_vectors()
+        # self.processed_hashes = self._load_status()
+
+        # if self.vector_store is None:
+        #     self.vector_store = {}
+
+        # self.vector_buffer = []  # (url_hash, content) 임시 보관
+        # self.vector_batch_size = 32 # 시스템 환경에 맞게 16~64 사이 조절
+        
+        # # 2. 임베딩 모델 로드 (다국어 및 한국어 성능이 좋은 경량 모델)
+        # print("[*] Loading Embedding Model (KR-SBERT)...")
+        # self.model = SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
+
         sst_files = sorted([f for f in os.listdir(self.index_dir) if f.endswith(".sst")])
         for f in sst_files:
             full_path = os.path.join(self.index_dir, f)
@@ -137,6 +159,10 @@ class LSMInvertedIndex:
 
     def flush(self):
         if not self.memtable: return
+
+        # 플러시할 때 남은 벡터 버퍼도 전부 처리
+        # self._process_vector_batch()
+
         # 파일 중복 방지를 위해 더 정밀한 타임스탬프 사용
         filename = f"sst_{int(time.time() * 1000000)}.sst"
         path = os.path.join(self.index_dir, filename)
@@ -151,10 +177,13 @@ class LSMInvertedIndex:
         
         self.memtable.clear()
         self.tables.append(NexusSSTable(path))
+
+        # 디스크 저장은 이 시점에 단 한 번만!
+        # self._save_vectors()
         print(f"[*] LSM Flush Complete: {filename}")
 
     def should_compact(self):
-        return len(self.tables) >= 5
+        return len(self.tables) >= 10
 
     @property
     def sstable_files(self):
@@ -168,12 +197,44 @@ class LSMInvertedIndex:
         if len(self.memtable) >= self.memtable_limit:
             self.flush()
 
+    # def _load_status(self):
+    #     if os.path.exists(self.status_file):
+    #         with open(self.status_file, 'r') as f:
+    #             return set(json.load(f))
+    #     return set()
+
+    # def _save_status(self):
+    #     with open(self.status_file, 'w') as f:
+    #         json.dump(list(self.processed_hashes), f)
+
+    # def _load_vectors(self):
+    #     if os.path.exists(self.vector_file):
+    #         try:
+    #             with open(self.vector_file, 'rb') as f:
+    #                 return pickle.load(f)
+    #         except: return {}
+    #     return {}
+
+    # def _save_vectors(self):
+    #     with open(self.vector_file, 'wb') as f:
+    #         pickle.dump(self.vector_store, f)
+
     def add_document(self, url_hash, content):
         words = self._tokenize(content)
         for word in words:
             self.memtable[word].add(url_hash)
+
+        # 2. 벡터 버퍼에 임시 저장 (즉시 인코딩 X)
+        # if url_hash not in self.vector_store:
+        #     self.vector_buffer.append((url_hash, content))
+            
+        # # 3. 버퍼가 꽉 차면 한 번에 Batch 인코딩 수행
+        # if len(self.vector_buffer) >= self.vector_batch_size:
+        #     self._process_vector_batch()
+            
         if len(self.memtable) >= self.memtable_limit:
             self.flush()
+            
 
     # def _tokenize(self, text):
     #     # 1. 소문자화 및 특수문자 제거
@@ -227,6 +288,55 @@ class LSMInvertedIndex:
         
         return tokens
     
+    # def build_vectors(self, raw_data_provider, batch_size=64):
+    #     """
+    #     [신규] 사후 벡터화 작업 수행 (이어하기 지원)
+    #     raw_data_provider: (url_hash, content) 튜플을 반환하는 제너레이터 또는 리스트
+    #     """
+    #     if self.model is None:
+    #         print("[*] Loading Embedding Model...")
+    #         self.model = SentenceTransformer('snunlp/KR-SBERT-V40K-klueNLI-augSTS')
+
+    #     pending_hashes = []
+    #     pending_texts = []
+    #     count = 0
+
+    #     print(f"[*] Starting Vectorization... (Already processed: {len(self.processed_hashes)})")
+
+    #     for url_hash, content in raw_data_provider:
+    #         # 이미 처리된 건너뛰기 (이어하기 핵심)
+    #         if url_hash in self.processed_hashes:
+    #             continue
+
+    #         pending_hashes.append(url_hash)
+    #         pending_texts.append(content)
+
+    #         # 배치 사이즈만큼 모이면 인코딩
+    #         if len(pending_hashes) >= batch_size:
+    #             self._execute_batch_vectorize(pending_hashes, pending_texts)
+    #             pending_hashes, pending_texts = [], []
+    #             count += batch_size
+                
+    #             # 중간 저장 (끊겼을 때를 대비)
+    #             if count % (batch_size * 10) == 0:
+    #                 self._save_vectors()
+    #                 self._save_status()
+    #                 print(f"[*] Progress: {count} documents vectorized and saved.")
+
+    #     # 남은 데이터 처리
+    #     if pending_hashes:
+    #         self._execute_batch_vectorize(pending_hashes, pending_texts)
+    #         self._save_vectors()
+    #         self._save_status()
+
+    #     print(f"[*] Vectorization complete. Total new: {count}")
+    
+    # def _execute_batch_vectorize(self, hashes, texts):
+    #     vectors = self.model.encode(texts, batch_size=len(texts), show_progress_bar=False)
+    #     for i, h in enumerate(hashes):
+    #         self.vector_store[h] = vectors[i]
+    #         self.processed_hashes.add(h)
+
     def remove_document_from_memtable(self, url_hash):
         """
         메모리에 있는 특정 문서의 흔적을 지움. 
@@ -342,6 +452,24 @@ class LSMInvertedIndex:
         tb = term.encode('utf-8')
         f.write(struct.pack(f"<H{len(tb)}sI", len(tb), tb, len(hashes)))
         for h in hashes: f.write(h)
+    
+    # def semantic_search(self, keyword):
+    #     """임베딩 벡터를 활용한 의미 기반 검색"""
+    #     query_vector = self.model.encode(keyword)
+    #     scores = []
+        
+    #     for url_hash, doc_vector in self.vector_store.items():
+    #         # 코사인 유사도 계산
+    #         norm_q = np.linalg.norm(query_vector)
+    #         norm_d = np.linalg.norm(doc_vector)
+    #         if norm_q == 0 or norm_d == 0: continue
+                
+    #         sim = np.dot(query_vector, doc_vector) / (norm_q * norm_d)
+    #         scores.append((url_hash, sim))
+            
+    #     # 유사도가 높은 순으로 정렬하여 URL 해시만 반환
+    #     scores.sort(key=lambda x: x[1], reverse=True)
+    #     return [item[0] for item in scores]
 
     # LSMInvertedIndex 클래스 내부
     def search(self, keyword):
@@ -386,6 +514,34 @@ class LSMInvertedIndex:
         # [(hash, score), ...] -> [hash, ...]
         sorted_results = [item[0] for item in score_map.most_common()]
         return sorted_results
+    
+    # def hybrid_search_rrf(self, keyword, k=60):
+    #     """
+    #     RRF (Reciprocal Rank Fusion) 기법을 이용한 하이브리드 검색
+    #     키워드 검색(LSM)과 의미 기반 검색(Vector) 결과를 융합합니다.
+    #     """
+    #     # 1. 키워드 기반 랭킹 검색 실행
+    #     # kw_results = self.ranking_search(keyword)
+        
+    #     # 2. 벡터 기반 의미 검색 실행
+    #     sem_results = self.semantic_search(keyword)
+        
+    #     # 3. RRF 점수 계산을 위한 딕셔너리
+    #     rrf_scores = collections.defaultdict(float)
+        
+    #     # 키워드 검색 결과 랭킹 반영 (1위=rank 0)
+    #     # for rank, url_hash in enumerate(kw_results):
+    #     #     rrf_scores[url_hash] += 1.0 / (k + rank + 1)
+            
+    #     # 의미 검색 결과 랭킹 반영
+    #     for rank, url_hash in enumerate(sem_results):
+    #         rrf_scores[url_hash] += 1.0 / (k + rank + 1)
+            
+    #     # 4. 합산된 RRF 점수가 높은 순서대로 최종 정렬
+    #     final_results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        
+    #     # 최종 URL 해시 리스트 반환
+    #     return [item[0] for item in final_results]
 
 import math
 import array

@@ -13,16 +13,16 @@ from .LSM import LSMInvertedIndex
 
 
 class NexusCore:
-    def __init__(self, base_dir="nexus_db", initial_buckets=1_000_000):
+    def __init__(self, base_dir="nexus_db", initial_buckets=1_000_000, read_only=0):
         self.base_dir = base_dir
         if not os.path.exists(self.base_dir): os.makedirs(self.base_dir)
         
-        self.index = DynamicNexusIndex(os.path.join(self.base_dir, "nexus.idx"))
+        self.index = DynamicNexusIndex(os.path.join(self.base_dir, "nexus.idx"), read_only=read_only)
         self.storage = ShardedNexusLogEngine(os.path.join(self.base_dir, "storage"))
         self.wal = NexusWAL(os.path.join(self.base_dir, "nexus.wal"))
         self.index_lock = NexusLock(self.index.f)
         self.lsm_index = LSMInvertedIndex(os.path.join(self.base_dir, "lsm_idx"))
-
+        self.read_only = read_only
         self.last_lsn = 0
         self._recover()
 
@@ -118,6 +118,7 @@ class NexusCore:
             self.lsm_index.add_document(record['u_hash'], record['content'])
             count += 1
             
+        self.lsm_index.flush()
         # 3. 헤더에 마지막 LSN 기록 및 Clean 설정
         # WAL의 마지막 LSN을 가져와서 기록하면 이후 WAL 복구와도 연동됨
         latest_lsn = self.wal.get_latest_lsn() 
@@ -127,6 +128,9 @@ class NexusCore:
         print(f"[*] Rebuild complete. {count} records restored.")
 
     def put(self, url, content, metadata=None):
+        # if self.read_only == 1:
+        #     print("This is Read Only mode")
+        #     return None
         u_hash = hashlib.sha256(url.encode()).digest()[:16]
         self.last_lsn += 1
         cur_lsn = self.last_lsn
@@ -143,7 +147,10 @@ class NexusCore:
                                    log_info['timestamp'], shard_id_int)
 
             # 3. LSM 반영
-            self.lsm_index.add_document(u_hash, content)
+            if metadata:
+                self.lsm_index.add_document(u_hash, metadata['description'])
+            else:
+                self.lsm_index.add_document(u_hash, content)
 
             # 4. WAL COMMIT
             self.wal.append(WAL_STATE.COMMIT, u_hash, 0, 0, 0, 0, cur_lsn)
@@ -215,6 +222,9 @@ class NexusCore:
         return results
 
     def delete(self, url):
+        # if self.read_only == 1:
+        #     print("This is Read Only mode")
+        #     return False
         u_hash = hashlib.sha256(url.encode()).digest()[:16]
         self.last_lsn += 1
         cur_lsn = self.last_lsn
