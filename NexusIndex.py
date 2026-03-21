@@ -50,8 +50,9 @@ class DynamicNexusIndex:
         )
 
         # 비정상 종료 감지: 파일이 존재하는데 is_clean이 0이면 리빌드 필요
-        if is_clean == 0 and self.last_lsn != 0:
-            self.is_rebuild_required = True
+        if self.read_only != 1:
+            if is_clean == 0 and self.last_lsn != 0:
+                self.is_rebuild_required = True
 
         # mmap 매핑
         file_size = HEADER_SIZE + (self.bucket_count * IDX_ENTRY_SIZE)
