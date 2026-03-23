@@ -349,68 +349,92 @@ class LSMInvertedIndex:
                     del self.memtable[word]
 
     def compact(self, active_hashes_provider=None):
-        """
-        active_hashes_provider: 현재 유효한(삭제되지 않은) 해시 집합을 주는 함수
-        이 함수를 통해 삭제된 데이터를 물리적으로 제거함
-        """
         if len(self.tables) < 2: return
         
-        # 유효한 해시 셋 가져오기 (NexusCore.index에서 관리하는 해시들)
+        # 1. 유효 해시 셋 미리 확보 (루프 밖에서 한 번만 수행)
         valid_hashes = None
         if active_hashes_provider:
             valid_hashes = active_hashes_provider()
 
-        output_name = f"compact_{int(time.time())}.sst"
-        output_path = os.path.join(self.index_dir, output_name)
-        
-        paths = [t.path for t in self.tables]
+        # 한 번에 열 파일 최대 개수 (OS 제한을 고려해 안전하게 64~128 추천)
+        max_chunk_size = 128
+
+        # 테이블 리스트가 하나가 될 때까지 반복 병합
+        while len(self.tables) > 1:
+            # 현재 테이블 목록에서 max_chunk_size만큼만 잘라냄
+            chunk = self.tables[:max_chunk_size]
+            remaining = self.tables[max_chunk_size:]
+            
+            # 병합 결과 파일명 생성 (타임스탬프 중복 방지를 위해 마이크로초 포함)
+            output_name = f"compact_{int(time.time() * 1000000)}.sst"
+            output_path = os.path.join(self.index_dir, output_name)
+            
+            print(f"[*] Batch Compacting {len(chunk)} files -> {output_name}...")
+            
+            # 실제 병합 수행 (내부에서 파일 open/close가 완결됨)
+            self._run_single_compact_batch(chunk, output_path, valid_hashes)
+            
+            # 2. 병합 완료 후 청크에 포함되었던 구형 파일들 삭제
+            for t in chunk:
+                try:
+                    if os.path.exists(t.path):
+                        os.remove(t.path)
+                except Exception as e:
+                    print(f"[!] Cleanup Error: {e}")
+
+            # 3. 새로 만든 결과물 + 남은 파일들을 합쳐서 다시 루프
+            # 새로 생성된 파일이 포함된 NexusSSTable 객체를 생성하여 리스트 갱신
+            self.tables = [NexusSSTable(output_path)] + remaining
+
+        print(f"[*] Full Compaction finished. Current SSTables: {len(self.tables)}")
+
+    def _run_single_compact_batch(self, target_tables, output_path, valid_hashes):
+        """기존의 머지 로직을 수행하는 내부 메서드 (파일 핸들 제어)"""
+        paths = [t.path for t in target_tables]
         iters = [SSTableIterator(p) for p in paths]
         heap = []
-        for i, it in enumerate(iters):
-            if it.current_entry: heapq.heappush(heap, (it.current_entry[0], i))
+        
+        try:
+            for i, it in enumerate(iters):
+                if it.current_entry:
+                    heapq.heappush(heap, (it.current_entry[0], i))
 
-        with open(output_path, "wb") as f:
-            f.write(struct.pack(HEADER_FMT, MAGIC, 0))
-            count, last_term, current_hashes = 0, None, set()
-            
-            while heap:
-                term, i = heapq.heappop(heap)
-                entry = iters[i].pop()
+            with open(output_path, "wb") as f:
+                f.write(struct.pack(HEADER_FMT, MAGIC, 0))
+                count, last_term, current_hashes = 0, None, set()
                 
-                if term == last_term:
-                    current_hashes.update(entry[1])
-                else:
-                    if last_term:
-                        # 유효한 해시만 필터링 (삭제된 문서 제거)
-                        if valid_hashes is not None:
-                            current_hashes &= valid_hashes
+                while heap:
+                    term, i = heapq.heappop(heap)
+                    entry = iters[i].pop()
+                    
+                    if term == last_term:
+                        current_hashes.update(entry[1])
+                    else:
+                        if last_term:
+                            if valid_hashes is not None:
+                                current_hashes &= valid_hashes
+                            if current_hashes:
+                                self._write_entry(f, last_term, current_hashes)
+                                count += 1
+                        last_term, current_hashes = term, set(entry[1])
+                    
+                    if iters[i].current_entry: 
+                        heapq.heappush(heap, (iters[i].current_entry[0], i))
+
+                if last_term:
+                    if valid_hashes is not None:
+                        current_hashes &= valid_hashes
+                    if current_hashes:
+                        self._write_entry(f, last_term, current_hashes)
+                        count += 1
                         
-                        if current_hashes: # 필터링 후에도 해시가 남은 경우만 씀
-                            self._write_entry(f, last_term, current_hashes)
-                            count += 1
-                    
-                    last_term, current_hashes = term, set(entry[1])
+                f.seek(4)
+                f.write(struct.pack("<I", count))
                 
-                if iters[i].current_entry: 
-                    heapq.heappush(heap, (iters[i].current_entry[0], i))
-
-            # 마지막 남은 엔트리 처리
-            if last_term:
-                if valid_hashes is not None:
-                    current_hashes &= valid_hashes
-                if current_hashes:
-                    self._write_entry(f, last_term, current_hashes)
-                    count += 1
-                    
-            f.seek(4); f.write(struct.pack("<I", count))
-
-        # 정리
-        for it in iters: it.close()
-        for p in paths: 
-            try: os.remove(p)
-            except: pass
-        self.tables = [NexusSSTable(output_path)]
-        print(f"[*] Compaction finished: {output_name}")
+        finally:
+            # [중요] 에러가 나더라도 반드시 모든 이터레이터의 파일 핸들을 닫음
+            for it in iters:
+                it.close()
     
     def _streaming_merge_to_file(self, target_files, output_path):
         paths = [os.path.join(self.index_dir, f) for f in target_files]
